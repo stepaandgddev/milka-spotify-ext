@@ -60,3 +60,4 @@ Spotify search uses the client's own `spotify:search:` URI. The first matching
 track is started by Spotify itself. The addon never reads Spotify credentials or
 sends data anywhere except to the local MPRIS interface.
 # milka-spotify-ext
+# milka-spotify-ext
