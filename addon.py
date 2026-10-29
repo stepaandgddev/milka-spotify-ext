@@ -1,7 +1,7 @@
-"""Control the local Spotify desktop app through MPRIS.
+"""Control the local Spotify desktop app through MPRIS or Windows media sessions.
 
-Linux only. Commands are sent to the running Spotify client through gdbus;
-no Spotify Web API, Premium account or Python D-Bus package is required.
+On Linux commands use MPRIS/gdbus. On Windows they use the native Global
+System Media Transport Controls API, so the Spotify Web API is not required.
 
 While Spotify is playing, the addon asks Milky to show the bundled
 ``assets/music_headphones.gif`` animation. Pausing or closing Spotify removes
@@ -11,6 +11,8 @@ it again.
 from __future__ import annotations
 
 import os
+import asyncio
+import inspect
 import re
 import shutil
 import subprocess
@@ -19,6 +21,15 @@ import time
 from typing import Any, Callable
 
 from addon_api import tool
+
+try:
+    from winrt.windows.media.control import (
+        GlobalSystemMediaTransportControlsSessionManager as _MediaManager,
+        GlobalSystemMediaTransportControlsSessionPlaybackStatus as _PlaybackStatus,
+    )
+except ImportError:  # Windows support is optional on Linux.
+    _MediaManager = None
+    _PlaybackStatus = None
 
 MPRIS_DEST = "org.mpris.MediaPlayer2.spotify"
 MPRIS_PATH = "/org/mpris/MediaPlayer2"
@@ -126,6 +137,61 @@ class LocalSpotify:
         self._available_until = 0.0
         self._available_value = False
 
+    @property
+    def _is_windows(self) -> bool:
+        return os.name == "nt"
+
+    @staticmethod
+    def _windows_call(operation):
+        """Run a WinRT async operation without requiring an event loop."""
+        result = operation()
+        if inspect.isawaitable(result):
+            return asyncio.run(result)
+        return result
+
+    def _windows_session(self):
+        if _MediaManager is None:
+            raise SpotifyError(
+                "Windows Spotify support needs the 'winrt-Windows.Media.Control' package."
+            )
+        manager = self._windows_call(_MediaManager.request_async)
+        sessions = manager.get_sessions()
+        for session in sessions:
+            source = str(
+                getattr(session, "source_app_user_model_id", "") or ""
+            ).lower()
+            # Store and classic Spotify builds expose different AUMIDs, for
+            # example SpotifyAB.SpotifyMusic_... and Spotify.exe. Do not rely
+            # on one exact package identifier.
+            if "spotify" in source or "spotify" in str(session).lower():
+                return session
+        return None
+
+    def _windows_now_playing(self) -> dict[str, Any]:
+        try:
+            session = self._windows_session()
+        except SpotifyError:
+            raise
+        except Exception as error:
+            raise SpotifyError(f"Windows media session error: {error}") from error
+        if session is None:
+            return {"connected": False}
+        try:
+            properties = self._windows_call(session.try_get_media_properties_async)
+            playback = session.get_playback_info()
+            status = playback.playback_status
+            playing = status == _PlaybackStatus.PLAYING
+            return {
+                "connected": True,
+                "playing": playing,
+                "device": "Spotify (Windows)",
+                "title": str(properties.title or ""),
+                "artist": str(properties.artist or ""),
+                "album": str(properties.album_title or ""),
+            }
+        except Exception as error:
+            raise SpotifyError(f"Could not read Spotify media session: {error}") from error
+
     @staticmethod
     def _run(args: list[str]) -> str:
         env = dict(os.environ)
@@ -207,6 +273,11 @@ class LocalSpotify:
             return self._runner(args)
 
     def available(self, refresh: bool = False) -> bool:
+        if self._is_windows:
+            value = bool(self._windows_now_playing().get("connected"))
+            self._available_value = value
+            self._available_until = time.monotonic() + 1.5
+            return value
         now = time.monotonic()
         if not refresh and now < self._available_until:
             return self._available_value
@@ -225,6 +296,8 @@ class LocalSpotify:
         return match.group(1) if match else "Stopped"
 
     def now_playing(self) -> dict[str, Any]:
+        if self._is_windows:
+            return self._windows_now_playing()
         if not self.available():
             return {"connected": False}
         try:
@@ -284,24 +357,52 @@ class LocalSpotify:
         return self._wait_for_playback("", timeout=1.5)
 
     def pause(self) -> dict[str, Any]:
+        if self._is_windows:
+            session = self._windows_session()
+            if session is None:
+                raise SpotifyError("Spotify is not running or has no active media session.")
+            self._windows_call(session.try_pause_async)
+            return self.now_playing()
         self._call("Pause")
         return self.now_playing()
 
     def resume(self) -> dict[str, Any]:
+        if self._is_windows:
+            session = self._windows_session()
+            if session is None:
+                raise SpotifyError("Spotify is not running or has no active media session.")
+            self._windows_call(session.try_play_async)
+            return self._wait_for_playback("", timeout=1.5)
         self._call("Play")
         return self._wait_for_playback("", timeout=1.5)
 
     def next(self) -> dict[str, Any]:
+        if self._is_windows:
+            session = self._windows_session()
+            if session is None:
+                raise SpotifyError("Spotify is not running or has no active media session.")
+            self._windows_call(session.try_skip_next_async)
+            return self._wait_for_playback("", timeout=3.0)
         before = self.now_playing().get("trackId", "")
         self._call("Next")
         return self._wait_for_playback(before, timeout=3.0)
 
     def previous(self) -> dict[str, Any]:
+        if self._is_windows:
+            session = self._windows_session()
+            if session is None:
+                raise SpotifyError("Spotify is not running or has no active media session.")
+            self._windows_call(session.try_skip_previous_async)
+            return self._wait_for_playback("", timeout=3.0)
         before = self.now_playing().get("trackId", "")
         self._call("Previous")
         return self._wait_for_playback(before, timeout=3.0)
 
     def set_volume(self, percent: Any) -> dict[str, Any]:
+        if self._is_windows:
+            raise SpotifyError(
+                "Spotify volume control is not available through Windows Media Sessions."
+            )
         try:
             value = max(0, min(100, int(float(percent))))
         except (TypeError, ValueError):
@@ -310,6 +411,17 @@ class LocalSpotify:
         return self.now_playing()
 
     def launch(self) -> bool:
+        if self._is_windows:
+            try:
+                os.startfile("spotify:")
+            except OSError:
+                return False
+            deadline = time.monotonic() + LAUNCH_TIMEOUT
+            while time.monotonic() < deadline:
+                if self.available(refresh=True):
+                    return True
+                time.sleep(0.4)
+            return self.available(refresh=True)
         flatpak = shutil.which("flatpak")
         command: list[str] | None = None
         if flatpak:
@@ -424,10 +536,7 @@ def _label(info: dict[str, Any], include_status: bool = True) -> str:
 
 def _sync_animation(ctx, info: dict[str, Any] | None = None) -> dict[str, Any]:
     if info is None:
-        try:
-            info = _spotify.now_playing()
-        except Exception:
-            info = {}
+        info = _spotify.now_playing()
     if info.get("playing"):
         _show_music_animation(ctx)
     else:
@@ -449,8 +558,16 @@ _watcher: _PlayingWatcher | None = None
     "Return Spotify playback status and the current track.",
 )
 def current_track(ctx):
-    info = _sync_animation(ctx)
+    try:
+        info = _sync_animation(ctx)
+    except SpotifyError as error:
+        return str(error)
     if not info.get("connected"):
+        if os.name == "nt":
+            return (
+                "Spotify is not visible to Windows Media Sessions. "
+                "Start playback once in the official Spotify desktop app."
+            )
         return "Spotify is not running."
     if not info.get("title"):
         return "Spotify is running, but no track is loaded."

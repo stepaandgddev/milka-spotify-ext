@@ -1,18 +1,25 @@
 # Spotify for Milky
 
-Controls the local Spotify desktop app through MPRIS. While Spotify is playing,
+Controls the local Spotify desktop app through MPRIS on Linux and Windows Media
+Sessions on Windows. While Spotify is playing,
 Milky shows the bundled `assets/music_headphones.gif` animation. Pausing or
 closing Spotify removes it again.
 
-The addon is Linux-only and uses `gdbus` from GLib. It does not need the Spotify
-Web API, a Premium account, or the `dbus-python` package.
+It does not need the Spotify Web API, a Premium account, or the `dbus-python`
+package.
 
 ## Requirements
 
-- Linux with a running graphical session
-- `gdbus` (usually from the `glib2` / `libglib2.0-bin` package)
+- Linux with a running graphical session and `gdbus` (usually from the `glib2`
+  / `libglib2.0-bin` package), or Windows 10/11.
 - Spotify desktop, installed as a Flatpak (`com.spotify.Client`) or a native
-  `spotify` command
+  `spotify` command on Linux.
+- Windows: install the optional WinRT bindings in the Python environment used
+  by Milky: `pip install winrt-Windows.Media.Control`.
+
+On Windows, open the official Spotify desktop app and start a track once. The
+addon reads the Spotify media session supplied by Windows; it does not inspect
+the Spotify window or use the browser player.
 
 ## Install
 
